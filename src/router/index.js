@@ -9,6 +9,8 @@ import ContactsPage from '../pages/ContactsPage.vue'
 import AccountPage from '../pages/AccountPage.vue'
 import BakerPage from '../pages/BakerPage.vue'
 import SuccessPage from '../pages/SuccessPage.vue'
+import LoginPage from '../pages/LoginPage.vue'
+import AuthCallbackPage from '../pages/AuthCallbackPage.vue'
 
 export const router = createRouter({
   history: createWebHistory(),
@@ -21,6 +23,8 @@ export const router = createRouter({
     { path: '/account', name: 'account', component: AccountPage },
     { path: '/admin', name: 'admin', component: AdminPage },
     { path: '/baker', name: 'baker', component: BakerPage },
-    { path: '/success', name: 'success', component: SuccessPage }
+    { path: '/success', name: 'success', component: SuccessPage },
+    { path: '/login', name: 'login', component: LoginPage },
+    { path: '/auth/callback', name: 'auth-callback', component: AuthCallbackPage }
   ]
 })
