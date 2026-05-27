@@ -1,5 +1,5 @@
 import jwt from 'jsonwebtoken';
-import pool from '../config/database.js';
+import { query } from '../config/database.js';
 
 export async function authenticate(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -14,16 +14,16 @@ export async function authenticate(req, res, next) {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     
     // Get fresh user data from database
-    const [users] = await pool.query(
-      'SELECT id, vk_id, first_name, last_name, photo_url, role FROM users WHERE id = ?',
-      [decoded.userId]
+    const result = await query(
+      'SELECT id, vk_id, first_name, last_name, photo_url, role FROM users WHERE id = @userId',
+      { userId: decoded.userId }
     );
 
-    if (users.length === 0) {
+    if (result.recordset.length === 0) {
       return res.status(401).json({ error: 'Пользователь не найден' });
     }
 
-    req.user = users[0];
+    req.user = result.recordset[0];
     next();
   } catch (error) {
     if (error.name === 'TokenExpiredError') {
@@ -46,13 +46,13 @@ export async function optionalAuth(req, res, next) {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     
-    const [users] = await pool.query(
-      'SELECT id, vk_id, first_name, last_name, photo_url, role FROM users WHERE id = ?',
-      [decoded.userId]
+    const result = await query(
+      'SELECT id, vk_id, first_name, last_name, photo_url, role FROM users WHERE id = @userId',
+      { userId: decoded.userId }
     );
 
-    if (users.length > 0) {
-      req.user = users[0];
+    if (result.recordset.length > 0) {
+      req.user = result.recordset[0];
     }
   } catch (error) {
     // Ignore token errors for optional auth

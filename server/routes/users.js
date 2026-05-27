@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import pool from '../config/database.js';
+import { query, getPool, sql } from '../config/database.js';
 import { authenticate } from '../middleware/auth.js';
 import { isAdmin } from '../middleware/roles.js';
 
@@ -10,19 +10,18 @@ router.get('/', authenticate, isAdmin, async (req, res) => {
   try {
     const { role, limit = 50, offset = 0 } = req.query;
 
-    let query = 'SELECT id, vk_id, first_name, last_name, photo_url, role, created_at FROM users WHERE 1=1';
-    const params = [];
+    let queryStr = 'SELECT id, vk_id, first_name, last_name, photo_url, role, created_at FROM users WHERE 1=1';
+    const params = { limit: parseInt(limit), offset: parseInt(offset) };
 
     if (role) {
-      query += ' AND role = ?';
-      params.push(role);
+      queryStr += ' AND role = @role';
+      params.role = role;
     }
 
-    query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
-    params.push(parseInt(limit), parseInt(offset));
+    queryStr += ' ORDER BY created_at DESC OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY';
 
-    const [users] = await pool.query(query, params);
-    res.json(users);
+    const result = await query(queryStr, params);
+    res.json(result.recordset);
   } catch (error) {
     console.error('Get users error:', error);
     res.status(500).json({ error: 'Ошибка получения пользователей' });
@@ -32,32 +31,34 @@ router.get('/', authenticate, isAdmin, async (req, res) => {
 // Get user profile
 router.get('/:id', authenticate, async (req, res) => {
   try {
+    const userId = parseInt(req.params.id);
+    
     // Users can only see their own profile, admins can see anyone
-    if (req.user.role !== 'admin' && req.user.id !== parseInt(req.params.id)) {
+    if (req.user.role !== 'admin' && req.user.id !== userId) {
       return res.status(403).json({ error: 'Недостаточно прав' });
     }
 
-    const [users] = await pool.query(
-      'SELECT id, vk_id, first_name, last_name, photo_url, role, created_at FROM users WHERE id = ?',
-      [req.params.id]
+    const result = await query(
+      'SELECT id, vk_id, first_name, last_name, photo_url, role, created_at FROM users WHERE id = @id',
+      { id: userId }
     );
 
-    if (users.length === 0) {
+    if (result.recordset.length === 0) {
       return res.status(404).json({ error: 'Пользователь не найден' });
     }
 
-    const user = users[0];
+    const user = result.recordset[0];
 
     // Get order stats for the user
-    const [stats] = await pool.query(`
+    const statsResult = await query(`
       SELECT 
         COUNT(*) as total_orders,
-        SUM(CASE WHEN status = 'completed' THEN total ELSE 0 END) as total_spent,
+        ISNULL(SUM(CASE WHEN status = 'completed' THEN total ELSE 0 END), 0) as total_spent,
         SUM(CASE WHEN status IN ('new', 'preparing', 'ready') THEN 1 ELSE 0 END) as active_orders
-      FROM orders WHERE user_id = ?
-    `, [req.params.id]);
+      FROM orders WHERE user_id = @userId
+    `, { userId });
 
-    user.stats = stats[0];
+    user.stats = statsResult.recordset[0];
 
     res.json(user);
   } catch (error) {
@@ -70,29 +71,30 @@ router.get('/:id', authenticate, async (req, res) => {
 router.patch('/:id/role', authenticate, isAdmin, async (req, res) => {
   try {
     const { role } = req.body;
+    const userId = parseInt(req.params.id);
 
     if (!['customer', 'baker', 'admin'].includes(role)) {
       return res.status(400).json({ error: 'Неверная роль' });
     }
 
     // Can't change own role
-    if (req.user.id === parseInt(req.params.id)) {
+    if (req.user.id === userId) {
       return res.status(400).json({ error: 'Нельзя изменить свою роль' });
     }
 
-    const [existing] = await pool.query('SELECT id FROM users WHERE id = ?', [req.params.id]);
-    if (existing.length === 0) {
+    const existing = await query('SELECT id FROM users WHERE id = @id', { id: userId });
+    if (existing.recordset.length === 0) {
       return res.status(404).json({ error: 'Пользователь не найден' });
     }
 
-    await pool.query('UPDATE users SET role = ? WHERE id = ?', [role, req.params.id]);
-
-    const [updated] = await pool.query(
-      'SELECT id, vk_id, first_name, last_name, photo_url, role, created_at FROM users WHERE id = ?',
-      [req.params.id]
+    const result = await query(
+      `UPDATE users SET role = @role 
+       OUTPUT INSERTED.id, INSERTED.vk_id, INSERTED.first_name, INSERTED.last_name, INSERTED.photo_url, INSERTED.role, INSERTED.created_at
+       WHERE id = @id`,
+      { role, id: userId }
     );
 
-    res.json(updated[0]);
+    res.json(result.recordset[0]);
   } catch (error) {
     console.error('Update user role error:', error);
     res.status(500).json({ error: 'Ошибка обновления роли' });

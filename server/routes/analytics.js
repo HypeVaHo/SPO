@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import pool from '../config/database.js';
+import { query } from '../config/database.js';
 import { authenticate } from '../middleware/auth.js';
 import { isAdmin } from '../middleware/roles.js';
 
@@ -12,42 +12,42 @@ router.get('/sales', authenticate, isAdmin, async (req, res) => {
     const days = parseInt(period);
 
     // Total sales and orders
-    const [totals] = await pool.query(`
+    const totalsResult = await query(`
       SELECT 
         COUNT(*) as total_orders,
         SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_orders,
         SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelled_orders,
-        SUM(CASE WHEN status = 'completed' THEN total ELSE 0 END) as total_revenue,
+        ISNULL(SUM(CASE WHEN status = 'completed' THEN total ELSE 0 END), 0) as total_revenue,
         AVG(CASE WHEN status = 'completed' THEN total ELSE NULL END) as avg_order_value
       FROM orders
-      WHERE created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
-    `, [days]);
+      WHERE created_at >= DATEADD(DAY, -@days, GETDATE())
+    `, { days });
 
     // Daily sales for the period
-    const [dailySales] = await pool.query(`
+    const dailySalesResult = await query(`
       SELECT 
-        DATE(created_at) as date,
+        CONVERT(DATE, created_at) as date,
         COUNT(*) as orders,
-        SUM(CASE WHEN status = 'completed' THEN total ELSE 0 END) as revenue
+        ISNULL(SUM(CASE WHEN status = 'completed' THEN total ELSE 0 END), 0) as revenue
       FROM orders
-      WHERE created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
-      GROUP BY DATE(created_at)
+      WHERE created_at >= DATEADD(DAY, -@days, GETDATE())
+      GROUP BY CONVERT(DATE, created_at)
       ORDER BY date
-    `, [days]);
+    `, { days });
 
     // Orders by status
-    const [byStatus] = await pool.query(`
+    const byStatusResult = await query(`
       SELECT status, COUNT(*) as count
       FROM orders
-      WHERE created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+      WHERE created_at >= DATEADD(DAY, -@days, GETDATE())
       GROUP BY status
-    `, [days]);
+    `, { days });
 
     res.json({
       period_days: days,
-      totals: totals[0],
-      daily: dailySales,
-      by_status: byStatus
+      totals: totalsResult.recordset[0],
+      daily: dailySalesResult.recordset,
+      by_status: byStatusResult.recordset
     });
   } catch (error) {
     console.error('Get sales analytics error:', error);
@@ -61,8 +61,8 @@ router.get('/popular', authenticate, isAdmin, async (req, res) => {
     const { limit = 10, period = '30' } = req.query;
     const days = parseInt(period);
 
-    const [popular] = await pool.query(`
-      SELECT 
+    const popularResult = await query(`
+      SELECT TOP(@limit)
         oi.product_id,
         oi.product_name,
         p.price as current_price,
@@ -76,15 +76,14 @@ router.get('/popular', authenticate, isAdmin, async (req, res) => {
       LEFT JOIN products p ON oi.product_id = p.id
       LEFT JOIN categories c ON p.category_id = c.id
       WHERE o.status = 'completed'
-        AND o.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+        AND o.created_at >= DATEADD(DAY, -@days, GETDATE())
       GROUP BY oi.product_id, oi.product_name, p.price, p.is_available, c.name
       ORDER BY total_sold DESC
-      LIMIT ?
-    `, [days, parseInt(limit)]);
+    `, { days, limit: parseInt(limit) });
 
     res.json({
       period_days: days,
-      products: popular
+      products: popularResult.recordset
     });
   } catch (error) {
     console.error('Get popular products error:', error);
@@ -99,52 +98,52 @@ router.get('/orders', authenticate, isAdmin, async (req, res) => {
     const days = parseInt(period);
 
     // Orders by hour of day
-    const [byHour] = await pool.query(`
+    const byHourResult = await query(`
       SELECT 
-        HOUR(created_at) as hour,
+        DATEPART(HOUR, created_at) as hour,
         COUNT(*) as orders
       FROM orders
-      WHERE created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
-      GROUP BY HOUR(created_at)
+      WHERE created_at >= DATEADD(DAY, -@days, GETDATE())
+      GROUP BY DATEPART(HOUR, created_at)
       ORDER BY hour
-    `, [days]);
+    `, { days });
 
     // Orders by day of week
-    const [byDayOfWeek] = await pool.query(`
+    const byDayOfWeekResult = await query(`
       SELECT 
-        DAYOFWEEK(created_at) as day_of_week,
+        DATEPART(WEEKDAY, created_at) as day_of_week,
         COUNT(*) as orders
       FROM orders
-      WHERE created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
-      GROUP BY DAYOFWEEK(created_at)
+      WHERE created_at >= DATEADD(DAY, -@days, GETDATE())
+      GROUP BY DATEPART(WEEKDAY, created_at)
       ORDER BY day_of_week
-    `, [days]);
+    `, { days });
 
     // New customers
-    const [newCustomers] = await pool.query(`
+    const newCustomersResult = await query(`
       SELECT COUNT(*) as count
       FROM users
       WHERE role = 'customer'
-        AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
-    `, [days]);
+        AND created_at >= DATEADD(DAY, -@days, GETDATE())
+    `, { days });
 
     // Repeat customers
-    const [repeatCustomers] = await pool.query(`
+    const repeatCustomersResult = await query(`
       SELECT COUNT(DISTINCT user_id) as count
       FROM orders
-      WHERE created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)
+      WHERE created_at >= DATEADD(DAY, -@days, GETDATE())
         AND user_id IN (
           SELECT user_id FROM orders
-          WHERE created_at < DATE_SUB(NOW(), INTERVAL ? DAY)
+          WHERE created_at < DATEADD(DAY, -@days, GETDATE())
         )
-    `, [days, days]);
+    `, { days });
 
     res.json({
       period_days: days,
-      by_hour: byHour,
-      by_day_of_week: byDayOfWeek,
-      new_customers: newCustomers[0].count,
-      repeat_customers: repeatCustomers[0].count
+      by_hour: byHourResult.recordset,
+      by_day_of_week: byDayOfWeekResult.recordset,
+      new_customers: newCustomersResult.recordset[0].count,
+      repeat_customers: repeatCustomersResult.recordset[0].count
     });
   } catch (error) {
     console.error('Get orders analytics error:', error);
@@ -156,24 +155,24 @@ router.get('/orders', authenticate, isAdmin, async (req, res) => {
 router.get('/dashboard', authenticate, isAdmin, async (req, res) => {
   try {
     // Today's stats
-    const [today] = await pool.query(`
+    const todayResult = await query(`
       SELECT 
         COUNT(*) as orders_today,
-        SUM(CASE WHEN status = 'completed' THEN total ELSE 0 END) as revenue_today,
+        ISNULL(SUM(CASE WHEN status = 'completed' THEN total ELSE 0 END), 0) as revenue_today,
         SUM(CASE WHEN status IN ('new', 'preparing') THEN 1 ELSE 0 END) as pending_orders
       FROM orders
-      WHERE DATE(created_at) = CURDATE()
+      WHERE CONVERT(DATE, created_at) = CONVERT(DATE, GETDATE())
     `);
 
     // Active orders (need attention)
-    const [activeOrders] = await pool.query(`
+    const activeOrdersResult = await query(`
       SELECT COUNT(*) as count
       FROM orders
       WHERE status IN ('new', 'preparing', 'ready')
     `);
 
     // Total users
-    const [users] = await pool.query(`
+    const usersResult = await query(`
       SELECT 
         COUNT(*) as total,
         SUM(CASE WHEN role = 'customer' THEN 1 ELSE 0 END) as customers,
@@ -183,18 +182,18 @@ router.get('/dashboard', authenticate, isAdmin, async (req, res) => {
     `);
 
     // Products stats
-    const [products] = await pool.query(`
+    const productsResult = await query(`
       SELECT 
         COUNT(*) as total,
-        SUM(CASE WHEN is_available THEN 1 ELSE 0 END) as available
+        SUM(CASE WHEN is_available = 1 THEN 1 ELSE 0 END) as available
       FROM products
     `);
 
     res.json({
-      today: today[0],
-      active_orders: activeOrders[0].count,
-      users: users[0],
-      products: products[0]
+      today: todayResult.recordset[0],
+      active_orders: activeOrdersResult.recordset[0].count,
+      users: usersResult.recordset[0],
+      products: productsResult.recordset[0]
     });
   } catch (error) {
     console.error('Get dashboard error:', error);

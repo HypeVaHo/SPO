@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import axios from 'axios';
 import jwt from 'jsonwebtoken';
-import pool from '../config/database.js';
+import { query, getPool, sql } from '../config/database.js';
 import { authenticate } from '../middleware/auth.js';
 
 const router = Router();
@@ -59,34 +59,40 @@ router.get('/vk/callback', async (req, res) => {
     const vkUser = userResponse.data.response[0];
 
     // Find or create user in database
-    const [existingUsers] = await pool.query(
-      'SELECT * FROM users WHERE vk_id = ?',
-      [vkUser.id]
+    const existingResult = await query(
+      'SELECT * FROM users WHERE vk_id = @vkId',
+      { vkId: vkUser.id }
     );
 
     let user;
 
-    if (existingUsers.length > 0) {
+    if (existingResult.recordset.length > 0) {
       // Update existing user
-      await pool.query(
-        'UPDATE users SET first_name = ?, last_name = ?, photo_url = ? WHERE vk_id = ?',
-        [vkUser.first_name, vkUser.last_name, vkUser.photo_200, vkUser.id]
+      await query(
+        'UPDATE users SET first_name = @firstName, last_name = @lastName, photo_url = @photoUrl WHERE vk_id = @vkId',
+        { 
+          firstName: vkUser.first_name, 
+          lastName: vkUser.last_name, 
+          photoUrl: vkUser.photo_200, 
+          vkId: vkUser.id 
+        }
       );
-      user = existingUsers[0];
+      user = existingResult.recordset[0];
     } else {
       // Create new user
-      const [result] = await pool.query(
-        'INSERT INTO users (vk_id, first_name, last_name, photo_url) VALUES (?, ?, ?, ?)',
-        [vkUser.id, vkUser.first_name, vkUser.last_name, vkUser.photo_200]
-      );
-      user = {
-        id: result.insertId,
-        vk_id: vkUser.id,
-        first_name: vkUser.first_name,
-        last_name: vkUser.last_name,
-        photo_url: vkUser.photo_200,
-        role: 'customer'
-      };
+      const pool = await getPool();
+      const insertResult = await pool.request()
+        .input('vkId', sql.BigInt, vkUser.id)
+        .input('firstName', sql.NVarChar, vkUser.first_name)
+        .input('lastName', sql.NVarChar, vkUser.last_name)
+        .input('photoUrl', sql.NVarChar, vkUser.photo_200)
+        .query(`
+          INSERT INTO users (vk_id, first_name, last_name, photo_url) 
+          OUTPUT INSERTED.id, INSERTED.vk_id, INSERTED.first_name, INSERTED.last_name, INSERTED.photo_url, INSERTED.role
+          VALUES (@vkId, @firstName, @lastName, @photoUrl)
+        `);
+      
+      user = insertResult.recordset[0];
     }
 
     // Generate JWT token
@@ -117,10 +123,8 @@ router.get('/me', authenticate, (req, res) => {
   });
 });
 
-// Logout (client-side token removal, but we can add server-side blacklist if needed)
+// Logout
 router.post('/logout', authenticate, (req, res) => {
-  // In a simple JWT setup, logout is handled client-side by removing the token
-  // For enhanced security, you could maintain a token blacklist
   res.json({ message: 'Выход выполнен' });
 });
 

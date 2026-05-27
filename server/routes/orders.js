@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import pool from '../config/database.js';
+import { query, getPool, sql } from '../config/database.js';
 import { authenticate } from '../middleware/auth.js';
 import { isBaker } from '../middleware/roles.js';
 import { sendOrderNotification } from '../services/vkNotifications.js';
@@ -7,7 +7,6 @@ import { sendOrderNotification } from '../services/vkNotifications.js';
 const router = Router();
 
 // Status flow: new -> preparing -> ready -> completed
-// Also: any status -> cancelled (by admin)
 const STATUS_FLOW = {
   new: ['preparing', 'cancelled'],
   preparing: ['ready', 'cancelled'],
@@ -29,21 +28,24 @@ router.get('/', authenticate, async (req, res) => {
   try {
     const { status, limit = 50, offset = 0 } = req.query;
     
-    let query = '';
-    let params = [];
+    let queryStr = '';
+    const params = {
+      limit: parseInt(limit),
+      offset: parseInt(offset)
+    };
 
     if (req.user.role === 'customer') {
       // Customers see only their orders
-      query = `
+      queryStr = `
         SELECT o.*, u.first_name, u.last_name
         FROM orders o
         JOIN users u ON o.user_id = u.id
-        WHERE o.user_id = ?
+        WHERE o.user_id = @userId
       `;
-      params = [req.user.id];
+      params.userId = req.user.id;
     } else {
       // Bakers and admins see all orders
-      query = `
+      queryStr = `
         SELECT o.*, u.first_name, u.last_name, u.vk_id
         FROM orders o
         JOIN users u ON o.user_id = u.id
@@ -52,22 +54,22 @@ router.get('/', authenticate, async (req, res) => {
     }
 
     if (status) {
-      query += ' AND o.status = ?';
-      params.push(status);
+      queryStr += ' AND o.status = @status';
+      params.status = status;
     }
 
-    query += ' ORDER BY o.created_at DESC LIMIT ? OFFSET ?';
-    params.push(parseInt(limit), parseInt(offset));
+    queryStr += ' ORDER BY o.created_at DESC OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY';
 
-    const [orders] = await pool.query(query, params);
+    const result = await query(queryStr, params);
+    const orders = result.recordset;
 
     // Get items for each order
     for (const order of orders) {
-      const [items] = await pool.query(
-        'SELECT * FROM order_items WHERE order_id = ?',
-        [order.id]
+      const itemsResult = await query(
+        'SELECT * FROM order_items WHERE order_id = @orderId',
+        { orderId: order.id }
       );
-      order.items = items;
+      order.items = itemsResult.recordset;
     }
 
     res.json(orders);
@@ -80,34 +82,34 @@ router.get('/', authenticate, async (req, res) => {
 // Get single order
 router.get('/:id', authenticate, async (req, res) => {
   try {
-    let query = `
+    let queryStr = `
       SELECT o.*, u.first_name, u.last_name, u.vk_id
       FROM orders o
       JOIN users u ON o.user_id = u.id
-      WHERE o.id = ?
+      WHERE o.id = @id
     `;
-    const params = [req.params.id];
+    const params = { id: parseInt(req.params.id) };
 
     // Customers can only see their own orders
     if (req.user.role === 'customer') {
-      query += ' AND o.user_id = ?';
-      params.push(req.user.id);
+      queryStr += ' AND o.user_id = @userId';
+      params.userId = req.user.id;
     }
 
-    const [orders] = await pool.query(query, params);
+    const result = await query(queryStr, params);
 
-    if (orders.length === 0) {
+    if (result.recordset.length === 0) {
       return res.status(404).json({ error: 'Заказ не найден' });
     }
 
-    const order = orders[0];
+    const order = result.recordset[0];
 
     // Get order items
-    const [items] = await pool.query(
-      'SELECT * FROM order_items WHERE order_id = ?',
-      [order.id]
+    const itemsResult = await query(
+      'SELECT * FROM order_items WHERE order_id = @orderId',
+      { orderId: order.id }
     );
-    order.items = items;
+    order.items = itemsResult.recordset;
 
     res.json(order);
   } catch (error) {
@@ -118,10 +120,11 @@ router.get('/:id', authenticate, async (req, res) => {
 
 // Create order
 router.post('/', authenticate, async (req, res) => {
-  const connection = await pool.getConnection();
+  const pool = await getPool();
+  const transaction = new sql.Transaction(pool);
   
   try {
-    await connection.beginTransaction();
+    await transaction.begin();
 
     const { items, comment } = req.body;
 
@@ -129,14 +132,17 @@ router.post('/', authenticate, async (req, res) => {
       return res.status(400).json({ error: 'Заказ должен содержать хотя бы один товар' });
     }
 
-    // Validate and get product details
+    // Get product details
     const productIds = items.map(item => item.product_id);
-    const [products] = await connection.query(
-      'SELECT id, name, price, is_available FROM products WHERE id IN (?)',
-      [productIds]
+    const placeholders = productIds.map((_, i) => `@p${i}`).join(',');
+    
+    const productsRequest = new sql.Request(transaction);
+    productIds.forEach((id, i) => productsRequest.input(`p${i}`, sql.Int, id));
+    const productsResult = await productsRequest.query(
+      `SELECT id, name, price, is_available FROM products WHERE id IN (${placeholders})`
     );
 
-    const productMap = new Map(products.map(p => [p.id, p]));
+    const productMap = new Map(productsResult.recordset.map(p => [p.id, p]));
 
     // Validate all products exist and are available
     let total = 0;
@@ -146,22 +152,22 @@ router.post('/', authenticate, async (req, res) => {
       const product = productMap.get(item.product_id);
       
       if (!product) {
-        await connection.rollback();
+        await transaction.rollback();
         return res.status(400).json({ error: `Продукт с ID ${item.product_id} не найден` });
       }
 
       if (!product.is_available) {
-        await connection.rollback();
+        await transaction.rollback();
         return res.status(400).json({ error: `Продукт "${product.name}" недоступен` });
       }
 
       const quantity = parseInt(item.quantity) || 1;
       if (quantity < 1) {
-        await connection.rollback();
+        await transaction.rollback();
         return res.status(400).json({ error: 'Количество должно быть больше 0' });
       }
 
-      const itemTotal = product.price * quantity;
+      const itemTotal = parseFloat(product.price) * quantity;
       total += itemTotal;
 
       validatedItems.push({
@@ -173,39 +179,46 @@ router.post('/', authenticate, async (req, res) => {
     }
 
     // Create order
-    const [orderResult] = await connection.query(
-      'INSERT INTO orders (user_id, total, comment) VALUES (?, ?, ?)',
-      [req.user.id, total, comment || null]
-    );
+    const orderRequest = new sql.Request(transaction);
+    const orderResult = await orderRequest
+      .input('userId', sql.Int, req.user.id)
+      .input('total', sql.Decimal(10, 2), total)
+      .input('comment', sql.NVarChar, comment || null)
+      .query(`
+        INSERT INTO orders (user_id, total, comment)
+        OUTPUT INSERTED.id
+        VALUES (@userId, @total, @comment)
+      `);
 
-    const orderId = orderResult.insertId;
+    const orderId = orderResult.recordset[0].id;
 
     // Create order items
     for (const item of validatedItems) {
-      await connection.query(
-        'INSERT INTO order_items (order_id, product_id, product_name, quantity, price) VALUES (?, ?, ?, ?, ?)',
-        [orderId, item.product_id, item.product_name, item.quantity, item.price]
-      );
+      const itemRequest = new sql.Request(transaction);
+      await itemRequest
+        .input('orderId', sql.Int, orderId)
+        .input('productId', sql.Int, item.product_id)
+        .input('productName', sql.NVarChar, item.product_name)
+        .input('quantity', sql.Int, item.quantity)
+        .input('price', sql.Decimal(10, 2), item.price)
+        .query(`
+          INSERT INTO order_items (order_id, product_id, product_name, quantity, price)
+          VALUES (@orderId, @productId, @productName, @quantity, @price)
+        `);
     }
 
-    await connection.commit();
+    await transaction.commit();
 
     // Fetch created order
-    const [newOrders] = await pool.query(
-      'SELECT * FROM orders WHERE id = ?',
-      [orderId]
-    );
-
-    const order = newOrders[0];
+    const newOrderResult = await query('SELECT * FROM orders WHERE id = @id', { id: orderId });
+    const order = newOrderResult.recordset[0];
     order.items = validatedItems;
 
     res.status(201).json(order);
   } catch (error) {
-    await connection.rollback();
+    await transaction.rollback();
     console.error('Create order error:', error);
     res.status(500).json({ error: 'Ошибка создания заказа' });
-  } finally {
-    connection.release();
   }
 });
 
@@ -219,19 +232,19 @@ router.patch('/:id/status', authenticate, isBaker, async (req, res) => {
     }
 
     // Get current order
-    const [orders] = await pool.query(
+    const orderResult = await query(
       `SELECT o.*, u.vk_id, u.first_name
        FROM orders o
        JOIN users u ON o.user_id = u.id
-       WHERE o.id = ?`,
-      [req.params.id]
+       WHERE o.id = @id`,
+      { id: parseInt(req.params.id) }
     );
 
-    if (orders.length === 0) {
+    if (orderResult.recordset.length === 0) {
       return res.status(404).json({ error: 'Заказ не найден' });
     }
 
-    const order = orders[0];
+    const order = orderResult.recordset[0];
     const allowedStatuses = STATUS_FLOW[order.status];
 
     if (!allowedStatuses.includes(status)) {
@@ -242,9 +255,9 @@ router.patch('/:id/status', authenticate, isBaker, async (req, res) => {
     }
 
     // Update status
-    await pool.query(
-      'UPDATE orders SET status = ? WHERE id = ?',
-      [status, req.params.id]
+    await query(
+      'UPDATE orders SET status = @status, updated_at = GETDATE() WHERE id = @id',
+      { status, id: parseInt(req.params.id) }
     );
 
     // Send VK notification
@@ -252,13 +265,13 @@ router.patch('/:id/status', authenticate, isBaker, async (req, res) => {
       await sendOrderNotification(order.vk_id, order.id, status, STATUS_LABELS[status]);
     } catch (notifError) {
       console.error('VK notification error:', notifError);
-      // Don't fail the request if notification fails
     }
 
-    const [updated] = await pool.query('SELECT * FROM orders WHERE id = ?', [req.params.id]);
-    updated[0].status_label = STATUS_LABELS[status];
+    const updatedResult = await query('SELECT * FROM orders WHERE id = @id', { id: parseInt(req.params.id) });
+    const updated = updatedResult.recordset[0];
+    updated.status_label = STATUS_LABELS[status];
 
-    res.json(updated[0]);
+    res.json(updated);
   } catch (error) {
     console.error('Update order status error:', error);
     res.status(500).json({ error: 'Ошибка обновления статуса' });
